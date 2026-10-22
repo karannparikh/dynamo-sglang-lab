@@ -1,0 +1,43 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Packaging / `pip install -e .`
+*.egg-info/
+build/
+dist/
+
+# Virtual environments (bootstrap_macos.sh puts one at ../.venv; this covers
+# anyone who creates one inside the repo instead)
+.venv/
+venv/
+
+# Test and tool caches
+.pytest_cache/
+.benchmarks/
+.coverage
+htmlcov/
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Local Kubernetes lab state (kubeconfig and generated artifacts)
+.local/
+
+# Local identities and credentials
+.env
+.env.*
+!.env.example
+.kube/
+.colima/
+.ssh/
+.aws/
+kubeconfig
+kubeconfig.*
+*.pem
+*.key
+*.p12
+*.pfx

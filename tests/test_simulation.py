@@ -1,0 +1,309 @@
+"""Behavior of the simulator itself: tokens, KV accounting, scheduling."""
+
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+
+from fakeengine import tokens as token_gen
+from fakeengine.config import SimConfig
+from fakeengine.kvcache import BlockPool, block_hashes
+from fakeengine.scheduler import Request, Scheduler
+from fakeengine.timing import TimingModel
+
+
+def _config(server_args, **overrides) -> SimConfig:
+    config = SimConfig.from_server_args(server_args(**overrides))
+    return config
+
+
+# -- tokens ----------------------------------------------------------------
+
+
+def test_token_stream_is_deterministic_per_prompt():
+    a = token_gen.take([1, 2, 3], 32000, 16)
+    b = token_gen.take([1, 2, 3], 32000, 16)
+    assert a == b
+
+
+def test_different_prompts_give_different_tokens():
+    assert token_gen.take([1, 2, 3], 32000, 16) != token_gen.take([1, 2, 4], 32000, 16)
+
+
+def test_tokens_avoid_the_special_id_range():
+    # Emitting a BOS/EOS id would terminate the frontend's stream early.
+    assert all(t >= 256 for t in token_gen.take([7], 32000, 200))
+
+
+def test_handoff_token_is_stable_and_in_vocab():
+    first = token_gen.handoff_token("req-abc", 1000)
+    assert first == token_gen.handoff_token("req-abc", 1000)
+    assert 0 <= first < 1000
+
+
+# -- KV block pool ---------------------------------------------------------
+
+
+def test_cumulative_hashes_distinguish_prefix_from_suffix():
+    shared_prefix = block_hashes([1, 2, 3, 4], 2)
+    other_prefix = block_hashes([9, 9, 3, 4], 2)
+    assert shared_prefix[0] != other_prefix[0]
+    # Same trailing block, different history => different cumulative hash.
+    assert shared_prefix[1] != other_prefix[1]
+
+
+def test_prefix_match_stops_at_first_miss():
+    pool = BlockPool(num_blocks=8, block_size=2)
+    hashes = block_hashes([1, 2, 3, 4, 5, 6], 2)
+    blocks = pool.allocate(3)
+    pool.insert_prefix(hashes, blocks)
+    pool.free(blocks)
+
+    diverging = block_hashes([1, 2, 99, 100, 5, 6], 2)
+    assert pool.match_prefix(diverging) == 1
+
+
+def test_allocation_fails_only_when_referenced_blocks_fill_the_pool():
+    pool = BlockPool(num_blocks=4, block_size=1)
+    held = pool.allocate(4)
+    assert pool.allocate(1) is None          # all four are referenced
+    pool.free(held)
+    assert pool.allocate(4) is not None
+
+
+def test_cached_but_unreferenced_blocks_are_evictable():
+    pool = BlockPool(num_blocks=4, block_size=1)
+    hashes = block_hashes([1, 2, 3, 4], 1)
+    blocks = pool.allocate(4)
+    pool.insert_prefix(hashes, blocks)
+    pool.free(blocks)
+    # Cached, but nothing references them, so a new request may take them.
+    assert pool.allocate(4) is not None
+
+
+# -- timing ----------------------------------------------------------------
+
+
+def test_prefill_scales_with_input_length(server_args):
+    timing = TimingModel(_config(server_args))
+    assert timing.prefill_ms(2000) > timing.prefill_ms(1000) > timing.prefill_ms(0)
+
+
+def test_decode_step_degrades_with_batch_size(server_args):
+    timing = TimingModel(_config(server_args))
+    assert timing.decode_step_ms(8) > timing.decode_step_ms(1)
+
+
+def test_transfer_time_is_inversely_proportional_to_bandwidth(server_args):
+    fast = TimingModel(_config(server_args, fake_kv_bandwidth_gb_s=64.0))
+    slow = TimingModel(_config(server_args, fake_kv_bandwidth_gb_s=8.0))
+    overhead = fast.config.kv_transfer_overhead_ms
+    fast_payload = fast.transfer_ms(10_000) - overhead
+    slow_payload = slow.transfer_ms(10_000) - overhead
+    assert slow_payload == pytest.approx(fast_payload * 8, rel=1e-6)
+
+
+# -- scheduler -------------------------------------------------------------
+
+
+async def _drain(request: Request) -> tuple:
+    tokens, reason = [], None
+    while True:
+        kind, payload = await request.queue.get()
+        if kind == "token":
+            tokens.append(payload)
+        else:
+            reason = payload
+            return tokens, reason
+
+
+async def test_scheduler_generates_the_requested_number_of_tokens(server_args):
+    scheduler = Scheduler(_config(server_args))
+    scheduler.start()
+    request = scheduler.submit(Request("r1", [1, 2, 3], max_new_tokens=5))
+    tokens, reason = await _drain(request)
+    assert len(tokens) == 5
+    assert reason == "length"
+    await scheduler.stop()
+
+
+async def test_scheduler_matches_the_standalone_token_stream(server_args):
+    config = _config(server_args)
+    scheduler = Scheduler(config)
+    scheduler.start()
+    prompt = [5, 6, 7]
+    request = scheduler.submit(Request("r1", prompt, max_new_tokens=4))
+    tokens, _ = await _drain(request)
+    assert tokens == token_gen.take(prompt, config.vocab_size, 4)
+    await scheduler.stop()
+
+
+async def test_prebuilt_request_leads_with_the_inherited_token(server_args):
+    """A disaggregated decode continues prefill's answer instead of restarting it."""
+    config = _config(server_args)
+    scheduler = Scheduler(config)
+    scheduler.start()
+    prompt = [5, 6, 7]
+    aggregated = token_gen.take(prompt, config.vocab_size, 4)
+
+    request = scheduler.submit(
+        Request("r1", prompt, max_new_tokens=4, prebuilt=True, first_token=aggregated[0])
+    )
+    tokens, _ = await _drain(request)
+    assert tokens == aggregated
+    await scheduler.stop()
+
+
+async def test_prebuilt_request_reports_the_prompt_as_cached(server_args):
+    scheduler = Scheduler(_config(server_args))
+    scheduler.start()
+    prompt = list(range(64))
+    request = scheduler.submit(
+        Request("r1", prompt, max_new_tokens=2, prebuilt=True, first_token=999)
+    )
+    await _drain(request)
+    assert request.cached_tokens == len(prompt)
+    await scheduler.stop()
+
+
+async def test_repeated_prompt_reports_a_prefix_cache_hit(server_args):
+    config = _config(server_args)
+    scheduler = Scheduler(config)
+    scheduler.start()
+    prompt = list(range(100, 164))
+
+    first = scheduler.submit(Request("r1", prompt, max_new_tokens=2))
+    await _drain(first)
+    assert first.cached_tokens == 0
+
+    second = scheduler.submit(Request("r2", prompt, max_new_tokens=2))
+    await _drain(second)
+    assert second.cached_tokens == len(prompt)
+    await scheduler.stop()
+
+
+async def test_batched_requests_all_complete_under_a_running_limit(server_args):
+    """Continuous batching must not drop or stall requests past the limit."""
+    scheduler = Scheduler(_config(server_args, max_running_requests=2))
+    scheduler.start()
+    requests = [
+        scheduler.submit(Request(f"r{i}", [i, i + 1, i + 2], max_new_tokens=3))
+        for i in range(6)
+    ]
+    results = await asyncio.gather(*(_drain(r) for r in requests))
+    assert [len(tokens) for tokens, _ in results] == [3] * 6
+    await scheduler.stop()
+
+
+async def test_requests_survive_kv_pressure_by_preemption(server_args):
+    """A pool far too small for the batch must still finish every request."""
+    scheduler = Scheduler(
+        _config(server_args, fake_num_kv_blocks=64, max_running_requests=8)
+    )
+    scheduler.start()
+    requests = [
+        scheduler.submit(Request(f"r{i}", list(range(i, i + 8)), max_new_tokens=6))
+        for i in range(6)
+    ]
+    results = await asyncio.gather(*(_drain(r) for r in requests))
+    assert all(reason == "length" for _, reason in results)
+    assert all(len(tokens) == 6 for tokens, _ in results)
+    await scheduler.stop()
+
+
+async def test_abort_finishes_the_request_promptly(server_args):
+    scheduler = Scheduler(_config(server_args))
+    scheduler.start()
+    request = scheduler.submit(Request("r1", [1, 2, 3], max_new_tokens=10_000))
+    await asyncio.sleep(0.05)
+    assert scheduler.abort("r1") is True
+    _, reason = await _drain(request)
+    assert reason == "abort"
+    await scheduler.stop()
+
+
+async def test_finished_requests_return_their_kv_blocks(server_args):
+    scheduler = Scheduler(_config(server_args))
+    scheduler.start()
+    request = scheduler.submit(Request("r1", list(range(32)), max_new_tokens=3))
+    await _drain(request)
+    # Blocks may stay cached for prefix reuse, but none may stay referenced.
+    assert scheduler.pool.can_allocate(scheduler.pool.num_blocks)
+    await scheduler.stop()
+
+
+# -- block pool: allocation policy the router depends on --------------------
+
+
+def test_new_content_does_not_evict_a_cached_prefix_while_clean_blocks_remain():
+    """Clean-first allocation.
+
+    Taking a cached block while untouched ones are free would discard a live
+    prefix on every new request -- and, because eviction is published, would
+    tell the router a prefix vanished moments after it appeared.
+    """
+    removed: list = []
+    pool = BlockPool(num_blocks=8, block_size=1, on_evict=removed.extend)
+
+    first = block_hashes([1, 2], 1)
+    blocks = pool.allocate(2)
+    pool.insert_prefix(first, blocks)
+    pool.free(blocks)
+
+    pool.allocate(2)                       # different content, plenty of room
+    assert pool.match_prefix(first) == 2
+    assert removed == []
+
+
+def test_eviction_is_least_recently_used():
+    pool = BlockPool(num_blocks=2, block_size=1)
+    older = block_hashes([1], 1)
+    newer = block_hashes([2], 1)
+
+    a = pool.allocate(1)
+    pool.insert_prefix(older, a)
+    pool.free(a)
+    b = pool.allocate(1)
+    pool.insert_prefix(newer, b)
+    pool.free(b)
+
+    pool.match_prefix(newer)               # touch it, making `older` the LRU
+    pool.allocate(1)                       # forces exactly one eviction
+    assert pool.match_prefix(older) == 0
+    assert pool.match_prefix(newer) == 1
+
+
+def test_acquiring_a_prefix_costs_no_new_blocks():
+    """A cache hit must actually save memory, not just report a number."""
+    pool = BlockPool(num_blocks=8, block_size=1)
+    hashes = block_hashes([1, 2, 3, 4], 1)
+    blocks = pool.allocate(4)
+    pool.insert_prefix(hashes, blocks)
+    pool.free(blocks)
+
+    before = pool.used_blocks
+    shared = pool.acquire_prefix(hashes)
+    assert shared == blocks
+    assert pool.used_blocks == before      # shared, not re-allocated
+
+
+def test_acquired_blocks_cannot_be_evicted_underneath_a_request():
+    pool = BlockPool(num_blocks=4, block_size=1)
+    hashes = block_hashes([1, 2, 3, 4], 1)
+    blocks = pool.allocate(4)
+    pool.insert_prefix(hashes, blocks)
+    pool.free(blocks)
+
+    held = pool.acquire_prefix(hashes)
+    assert len(held) == 4
+    assert pool.allocate(1) is None        # every block is referenced again
+    assert pool.match_prefix(hashes) == 4
+
+
+def test_a_failed_allocation_strands_no_blocks():
+    pool = BlockPool(num_blocks=3, block_size=1)
+    held = pool.allocate(3)
+    assert pool.allocate(2) is None        # cannot be satisfied
+    pool.free(held)
+    assert pool.allocate(3) is not None    # nothing was lost on the way out
