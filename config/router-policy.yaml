@@ -1,0 +1,13 @@
+default_policy_family: regular
+uncached_isl_buckets:
+  - min_tokens: 0
+    bucket: all
+policy_classes:
+  - name: regular
+    policy_family: regular
+    cache_bucket: all
+    queue_policy: fcfs
+    quantum: 1
+    prefill_busy_threshold: 8192
+    request_queue_limit_per_worker: 100
+    raw_isl_token_queue_limit_per_worker: 100

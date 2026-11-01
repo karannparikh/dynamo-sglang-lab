@@ -1,31 +1,19 @@
-[project]
-name = "fake-sglang"
-version = "0.1.0"
-description = "CPU-only fake SGLang engine that simulates prefill, decode, and KV-cache transfer for Dynamo"
-readme = "README.md"
-requires-python = ">=3.10"
-dependencies = [
-    "numpy",
-    "pydantic>=2.10",
-    "aiohttp>=3.9",
-    "msgspec>=0.19.0",
-    "pyzmq>=26.0.0",
-    "prometheus-client>=0.21.0",
-]
-
-[project.optional-dependencies]
-dev = ["pytest", "pytest-asyncio"]
-
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=75"]
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "dynamo-routing-harness"
+version = "0.1.0"
+description = "Apple Silicon CPU-only Dynamo routing benchmark harness"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+dynamo-routing-lab = "dynamo_routing_harness.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["sglang*", "fakeengine*"]
-
-[tool.pytest.ini_options]
-asyncio_mode = "auto"

@@ -1,0 +1,114 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus
+  namespace: observability
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 5s
+      evaluation_interval: 5s
+    rule_files:
+      - /etc/prometheus/dynamo-1.5-dashboard-compatibility.yml
+    scrape_configs:
+      - job_name: otel-collector
+        honor_labels: true
+        static_configs:
+          - targets: [otel-collector.observability.svc.cluster.local:8889]
+      - job_name: prometheus
+        static_configs:
+          - targets: [localhost:9090]
+  dynamo-1.5-dashboard-compatibility.yml: |
+    groups:
+      - name: dynamo-1.5-dashboard-compatibility
+        interval: 5s
+        rules:
+          - record: dynamo_frontend_output_tokens_total
+            expr: dynamo_component_router_output_sequence_tokens_sum
+          - record: dynamo_frontend_output_sequence_tokens_sum
+            expr: dynamo_component_router_output_sequence_tokens_sum
+          - record: dynamo_frontend_output_sequence_tokens_count
+            expr: dynamo_component_router_output_sequence_tokens_count
+          - record: dynamo_frontend_time_to_first_token_seconds_bucket
+            expr: dynamo_component_router_time_to_first_token_seconds_bucket
+          - record: dynamo_frontend_time_to_first_token_seconds_sum
+            expr: dynamo_component_router_time_to_first_token_seconds_sum
+          - record: dynamo_frontend_time_to_first_token_seconds_count
+            expr: dynamo_component_router_time_to_first_token_seconds_count
+          - record: dynamo_frontend_inter_token_latency_seconds_bucket
+            expr: dynamo_component_router_inter_token_latency_seconds_bucket
+          - record: dynamo_frontend_inter_token_latency_seconds_sum
+            expr: dynamo_component_router_inter_token_latency_seconds_sum
+          - record: dynamo_frontend_inter_token_latency_seconds_count
+            expr: dynamo_component_router_inter_token_latency_seconds_count
+          - record: dynamo_frontend_active_requests
+            expr: dynamo_request_plane_inflight_requests
+          - record: dynamo_frontend_queued_requests
+            expr: sum without (model, policy_class, worker_type) (dynamo_frontend_router_queue_pending_requests)
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: observability
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels: {app: prometheus}
+  template:
+    metadata:
+      labels: {app: prometheus}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v3.7.3
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time=48h
+            - --storage.tsdb.retention.size=3GB
+          ports:
+            - {name: http, containerPort: 9090}
+          volumeMounts:
+            - {name: config, mountPath: /etc/prometheus}
+            - {name: data, mountPath: /prometheus}
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {cpu: "1", memory: 1Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+          readinessProbe:
+            httpGet: {path: /-/ready, port: http}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /-/healthy, port: http}
+            periodSeconds: 15
+            failureThreshold: 3
+      volumes:
+        - name: config
+          configMap: {name: prometheus}
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: observability
+spec:
+  selector: {app: prometheus}
+  ports:
+    - {name: http, port: 9090, targetPort: http}
