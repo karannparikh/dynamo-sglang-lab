@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nats-exporter
+  namespace: dynamo-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: nats-exporter}
+  template:
+    metadata:
+      labels: {app: nats-exporter}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: exporter
+          image: natsio/prometheus-nats-exporter:0.17.3
+          args:
+            - -varz
+            - -connz
+            - -jsz=all
+            - http://dynamo-platform-nats-headless:8222
+          ports:
+            - {name: metrics, containerPort: 7777}
+          resources:
+            requests: {cpu: 25m, memory: 64Mi}
+            limits: {cpu: 250m, memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+          readinessProbe:
+            httpGet: {path: /metrics, port: metrics}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /metrics, port: metrics}
+            periodSeconds: 15
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nats-exporter
+  namespace: dynamo-system
+spec:
+  selector: {app: nats-exporter}
+  ports:
+    - {name: metrics, port: 7777, targetPort: metrics}

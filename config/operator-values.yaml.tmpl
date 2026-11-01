@@ -1,0 +1,35 @@
+global:
+  nats:
+    install: true
+  etcd:
+    install: true
+  kai-scheduler:
+    install: false
+    enabled: false
+  grove:
+    install: false
+    enabled: false
+  snapshot:
+    install: false
+dynamo-operator:
+  discoveryBackend: kubernetes
+  controllerManager:
+    manager:
+      image:
+        repository: __OPERATOR_REPOSITORY__
+        tag: __OPERATOR_TAG__
+        pullPolicy: __OPERATOR_PULL_POLICY__
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 1
+          memory: 1Gi
+  dynamo:
+    metrics:
+      prometheusEndpoint: http://prometheus.observability.svc.cluster.local:9090
+      podMonitors:
+        enabled: false
+  metricsService:
+    enabled: false
